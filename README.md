@@ -9,15 +9,24 @@ A read-only PowerShell script that tells you, honestly, whether a Windows machin
 
 JSON and CSV reports are written to `C:\Users\Public\AdminPackReports\PatchStatus` (change with `-ExportPath`).
 
-## Honest exit codes
+## Honest results
 
-| Code | Meaning |
-|---|---|
-| 0 | Every check ran. A pending reboot or stale patch is a finding, not a failure. |
-| 2 | PARTIAL: a check could not run. The red banner says which one and why. |
-| 1 | FAILED: the report could not be written. |
+Every run puts one result object on the pipeline and sets a matching exit code, so it works both in a console and in tools that only see exit codes.
 
-Check `$LASTEXITCODE` in scheduled tasks and RMM tools so a skipped check never looks like a pass.
+| Status | Exit code | Meaning |
+|---|---|---|
+| OK | 0 | Every check ran. A pending reboot or stale patch is a finding, not a failure. |
+| Partial | 2 | A check could not run. `ChecksNotRun` (and the red banner) says which one and why. |
+| Failed | 1 | The report could not be written. |
+
+```powershell
+$r = .\Get-PatchStatusReport.ps1
+$r.Status          # OK / Partial / Failed
+$r.RebootReasons
+$r.ChecksNotRun
+```
+
+In scheduled tasks and RMM tools, check the exit code so a skipped check never looks like a pass. For Intune remediation, wrap it: Intune reads exit 1 from a detection script as "non-compliant".
 
 ## Usage
 
