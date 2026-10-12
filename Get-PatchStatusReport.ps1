@@ -22,13 +22,14 @@
     $r = .\Get-PatchStatusReport.ps1 -IncludePendingUpdates -StaleDays 30 -ExportPath "C:\AuditReports\Patch"
     $r.Status; $r.RebootReasons; $r.ChecksNotRun
 .NOTES
-    Status / exit code:
+    Result: outputs one object with Status OK / Partial / Failed and sets the matching exit code
+    (0 / 2 / 1) for Task Scheduler and RMM tools.
       OK      / 0 = every check ran. A pending reboot or stale patch is a finding, not a failure.
       Partial / 2 = one or more checks could not run (see ChecksNotRun for which and why).
       Failed  / 1 = the report files could not be written.
     Intune remediation treats exit 1 from a detection script as "non-compliant", so wrap this script
     rather than using it directly as an Intune detection script.
-    Version 1.1: pipeline result object, generic lists instead of array +=, no script-scope writes.
+    Version 1.1.0
 #>
 [CmdletBinding()]
 param(
@@ -55,9 +56,11 @@ function New-CheckNotRun {
 }
 
 $Report = [ordered]@{
+    Script             = 'Get-PatchStatusReport.ps1'
     ComputerName       = $env:COMPUTERNAME
     GeneratedAt        = (Get-Date).ToString('s')
     Status             = $null
+    ExitCode           = $null
     OS                 = $null
     OSVersion          = $null
     LastBootTime       = $null
@@ -169,7 +172,7 @@ if ($IncludePendingUpdates) {
 
 $Report.Findings = $findings.ToArray()
 $Report.ChecksNotRun = $checksNotRun.ToArray()
-$Report.Status = if ($checksNotRun.Count -gt 0) { 'Partial' } else { 'OK' }
+if ($checksNotRun.Count -gt 0) { $Report.Status = 'Partial'; $Report.ExitCode = 2 } else { $Report.Status = 'OK'; $Report.ExitCode = 0 }
 
 # Export. The ordered dictionary goes to JSON as is (nested arrays kept). The CSV is a flattened
 # one-row summary, because Export-Csv would write the array properties as "System.Object[]".
@@ -198,6 +201,7 @@ try {
 } catch {
     Write-Host "FAILED: could not write the report to ${ExportPath}: $($_.Exception.Message)" -ForegroundColor Red
     $Report.Status = 'Failed'
+    $Report.ExitCode = 1
     $Report.ReportPath = $null
     [PSCustomObject]$Report
     exit 1

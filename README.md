@@ -12,6 +12,7 @@ JSON and CSV reports are written to `C:\Users\Public\AdminPackReports\PatchStatu
 ## Honest results
 
 Every run puts one result object on the pipeline and sets a matching exit code, so it works both in a console and in tools that only see exit codes.
+The object starts with `Script`, `ComputerName`, `Status` and `ExitCode`, followed by the patch details and `ReportPath`.
 
 | Status | Exit code | Meaning |
 |---|---|---|
