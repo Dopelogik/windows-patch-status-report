@@ -8,8 +8,9 @@
     - How long since the last reboot?
     - Optionally: which updates are waiting to install (uses the Windows Update agent, can take a few minutes).
 
-    Outputs one result object to the pipeline with a Status of OK, Partial or Failed, writes JSON and CSV
-    reports, and sets an exit code for callers that only see exit codes (Task Scheduler, RMM tools).
+    Outputs one result object to the pipeline with a Status of OK, Warning, Failed or Partial, writes JSON
+    and CSV reports from that same object, and sets a Nagios style exit code for callers that only see
+    exit codes (Task Scheduler, RMM and monitoring tools).
 .PARAMETER ExportPath
     Folder for the JSON and CSV reports. Created if missing.
 .PARAMETER StaleDays
@@ -20,16 +21,16 @@
     .\Get-PatchStatusReport.ps1
 .EXAMPLE
     $r = .\Get-PatchStatusReport.ps1 -IncludePendingUpdates -StaleDays 30 -ExportPath "C:\AuditReports\Patch"
-    $r.Status; $r.RebootReasons; $r.ChecksNotRun
+    $r.Status; $r.Findings; $r.RebootReasons; $r.ChecksNotRun
 .NOTES
-    Result: outputs one object with Status OK / Partial / Failed and sets the matching exit code
-    (0 / 2 / 1) for Task Scheduler and RMM tools.
-      OK      / 0 = every check ran. A pending reboot or stale patch is a finding, not a failure.
-      Partial / 2 = one or more checks could not run (see ChecksNotRun for which and why).
-      Failed  / 1 = the report files could not be written.
-    Intune remediation treats exit 1 from a detection script as "non-compliant", so wrap this script
-    rather than using it directly as an Intune detection script.
-    Version 1.1.0
+    Result: one object with a Status, plus the matching exit code (same meanings as Nagios plugins).
+      OK      / 0 = every check ran and nothing needs attention.
+      Warning / 1 = every check ran, with findings (pending reboot, stale patch, waiting updates).
+      Failed  / 2 = the report files could not be written.
+      Partial / 3 = one or more checks could not run (see ChecksNotRun for which and why).
+    Intune remediation treats any non-zero exit from a detection script as "non-compliant", so wrap this
+    script rather than using it directly as an Intune detection script.
+    Version 2.0.0 (exit codes changed from 1.x: see README).
 #>
 [CmdletBinding()]
 param(
@@ -55,6 +56,25 @@ function New-CheckNotRun {
     [PSCustomObject]@{ Check = $Check; Reason = $Reason }
 }
 
+function ConvertTo-InstallDate {
+    # Win32_QuickFixEngineering.InstalledOn is a string. It is usually M/d/yyyy, but some machines
+    # store other formats or a hex FILETIME, and a plain [datetime] cast throws on those.
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $text = $Value.Trim()
+    $parsed = [datetime]::MinValue
+    $formats = [string[]]@('M/d/yyyy', 'MM/dd/yyyy', 'yyyy-MM-dd', 'yyyyMMdd', 'd/M/yyyy', 'dd/MM/yyyy', 'd.M.yyyy', 'dd.MM.yyyy')
+    if ([datetime]::TryParseExact($text, $formats, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        return $parsed
+    }
+    if ($text -match '^[0-9A-Fa-f]{16}$') {
+        try { return [datetime]::FromFileTime([Convert]::ToInt64($text, 16)) } catch { }
+    }
+    if ([datetime]::TryParse($text, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
 $Report = [ordered]@{
     Script             = 'Get-PatchStatusReport.ps1'
     ComputerName       = $env:COMPUTERNAME
@@ -66,6 +86,7 @@ $Report = [ordered]@{
     LastBootTime       = $null
     UptimeDays         = $null
     LastPatchDate      = $null
+    LastPatchKB        = $null
     DaysSinceLastPatch = $null
     PatchStale         = $null
     RebootPending      = $null
@@ -86,7 +107,8 @@ try {
     $Report.OS = $os.Caption
     $Report.OSVersion = $os.Version
     $Report.LastBootTime = $os.LastBootUpTime.ToString('s')
-    $Report.UptimeDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+    # Both sides in UTC, so a daylight saving change since boot does not shift uptime by an hour.
+    $Report.UptimeDays = [math]::Round(((Get-Date).ToUniversalTime() - $os.LastBootUpTime.ToUniversalTime()).TotalDays, 1)
     Write-Host "  -> $($os.Caption) ($($os.Version)), up $($Report.UptimeDays) days" -ForegroundColor Gray
 } catch {
     $checksNotRun.Add((New-CheckNotRun -Check 'OperatingSystem' -Reason $_.Exception.Message))
@@ -95,21 +117,29 @@ try {
 # 2. Last installed update
 Write-Host "`n[2/4] Last installed update..." -ForegroundColor Yellow
 try {
-    $latest = Get-CimInstance -ClassName Win32_QuickFixEngineering |
-        Where-Object { $_.InstalledOn } |
-        Select-Object -Property HotFixID, @{ Name = 'InstalledOn'; Expression = { [datetime]$_.InstalledOn } } |
-        Sort-Object -Property InstalledOn -Descending |
-        Select-Object -First 1
+    $hotfixes = @(Get-CimInstance -ClassName Win32_QuickFixEngineering)
+    $dated = @(
+        foreach ($hf in $hotfixes) {
+            $installedOn = ConvertTo-InstallDate -Value $hf.InstalledOn
+            if ($installedOn) { [PSCustomObject]@{ HotFixID = $hf.HotFixID; InstalledOn = $installedOn } }
+        }
+    )
+    $undated = $hotfixes.Count - $dated.Count
+    if ($undated -gt 0) {
+        Write-Host "  -> $undated update(s) had no readable install date and were skipped" -ForegroundColor DarkGray
+    }
+    $latest = $dated | Sort-Object -Property InstalledOn -Descending | Select-Object -First 1
     if ($latest) {
         $Report.LastPatchDate = $latest.InstalledOn.ToString('yyyy-MM-dd')
-        $Report.DaysSinceLastPatch = [int]((Get-Date) - $latest.InstalledOn).TotalDays
+        $Report.LastPatchKB = $latest.HotFixID
+        $Report.DaysSinceLastPatch = ((Get-Date).Date - $latest.InstalledOn.Date).Days
         $Report.PatchStale = ($Report.DaysSinceLastPatch -gt $StaleDays)
         Write-Host "  -> Newest update $($latest.HotFixID) installed $($Report.LastPatchDate) ($($Report.DaysSinceLastPatch) days ago)" -ForegroundColor Gray
         if ($Report.PatchStale) {
             $findings.Add("Last update is $($Report.DaysSinceLastPatch) days old (threshold $StaleDays).")
         }
     } else {
-        $checksNotRun.Add((New-CheckNotRun -Check 'LastPatchDate' -Reason 'No installed update reported an install date.'))
+        $checksNotRun.Add((New-CheckNotRun -Check 'LastPatchDate' -Reason 'No installed update reported a readable install date.'))
     }
 } catch {
     $checksNotRun.Add((New-CheckNotRun -Check 'LastPatchDate' -Reason $_.Exception.Message))
@@ -170,57 +200,69 @@ if ($IncludePendingUpdates) {
     Write-Host "`n[4/4] Waiting updates: skipped (add -IncludePendingUpdates to check)" -ForegroundColor DarkGray
 }
 
+# Status and exit code (Nagios style). A check that could not run outranks findings, so a skipped
+# check never hides behind a plain Warning.
 $Report.Findings = $findings.ToArray()
 $Report.ChecksNotRun = $checksNotRun.ToArray()
-if ($checksNotRun.Count -gt 0) { $Report.Status = 'Partial'; $Report.ExitCode = 2 } else { $Report.Status = 'OK'; $Report.ExitCode = 0 }
+if ($checksNotRun.Count -gt 0) {
+    $Report.Status = 'Partial'; $Report.ExitCode = 3
+} elseif ($findings.Count -gt 0) {
+    $Report.Status = 'Warning'; $Report.ExitCode = 1
+} else {
+    $Report.Status = 'OK'; $Report.ExitCode = 0
+}
 
-# Export. The ordered dictionary goes to JSON as is (nested arrays kept). The CSV is a flattened
-# one-row summary, because Export-Csv would write the array properties as "System.Object[]".
+# One result object. The JSON keeps the nested detail; the CSV is a one-row view of the same object
+# with the array properties joined into strings (Export-Csv would otherwise write "System.Object[]").
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$jsonFile = Join-Path -Path $ExportPath -ChildPath "PatchStatus_$($env:COMPUTERNAME)_$stamp.json"
+$csvFile = Join-Path -Path $ExportPath -ChildPath "PatchStatus_$($env:COMPUTERNAME)_$stamp.csv"
+$Report.ReportPath = $jsonFile
+$Result = [PSCustomObject]$Report
+
+$csvColumns = @(
+    'ComputerName', 'GeneratedAt', 'Status', 'ExitCode', 'OS', 'OSVersion', 'UptimeDays',
+    'LastPatchDate', 'LastPatchKB', 'DaysSinceLastPatch', 'PatchStale', 'RebootPending',
+    @{ Name = 'RebootReasons'; Expression = { $_.RebootReasons -join '; ' } },
+    'PendingUpdateCount',
+    @{ Name = 'Findings'; Expression = { $_.Findings -join '; ' } },
+    @{ Name = 'ChecksNotRun'; Expression = { ($_.ChecksNotRun | ForEach-Object { $_.Check }) -join '; ' } }
+)
+
 try {
     if (-not (Test-Path -Path $ExportPath)) {
         New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null
     }
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $jsonFile = Join-Path -Path $ExportPath -ChildPath "PatchStatus_$($env:COMPUTERNAME)_$stamp.json"
-    $csvFile = Join-Path -Path $ExportPath -ChildPath "PatchStatus_$($env:COMPUTERNAME)_$stamp.csv"
-    $Report.ReportPath = $jsonFile
-    $Report | ConvertTo-Json -Depth 5 | Set-Content -Path $jsonFile -Encoding UTF8
-    [PSCustomObject]@{
-        ComputerName       = $Report.ComputerName
-        Status             = $Report.Status
-        OS                 = $Report.OS
-        UptimeDays         = $Report.UptimeDays
-        LastPatchDate      = $Report.LastPatchDate
-        DaysSinceLastPatch = $Report.DaysSinceLastPatch
-        PatchStale         = $Report.PatchStale
-        RebootPending      = $Report.RebootPending
-        RebootReasons      = $Report.RebootReasons -join '; '
-        PendingUpdateCount = $Report.PendingUpdateCount
-        ChecksNotRun       = ($Report.ChecksNotRun | ForEach-Object { $_.Check }) -join '; '
-    } | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+    $Result | ConvertTo-Json -Depth 5 | Set-Content -Path $jsonFile -Encoding UTF8
+    $Result | Select-Object -Property $csvColumns | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
 } catch {
     Write-Host "FAILED: could not write the report to ${ExportPath}: $($_.Exception.Message)" -ForegroundColor Red
-    $Report.Status = 'Failed'
-    $Report.ExitCode = 1
-    $Report.ReportPath = $null
-    [PSCustomObject]$Report
-    exit 1
+    $Result.Status = 'Failed'
+    $Result.ExitCode = 2
+    $Result.ReportPath = $null
 }
 
 Write-Host ""
-if ($Report.Status -eq 'Partial') {
-    Write-Host "==========================================================" -ForegroundColor Red
-    Write-Host " PARTIAL: $($checksNotRun.Count) check(s) could not run. Report: $jsonFile" -ForegroundColor Red
-    foreach ($c in $checksNotRun) { Write-Host "   - $($c.Check): $($c.Reason)" -ForegroundColor Red }
-    Write-Host "==========================================================" -ForegroundColor Red
-    [PSCustomObject]$Report
-    exit 2
+$color = switch ($Result.Status) {
+    'OK'      { 'Green' }
+    'Warning' { 'Yellow' }
+    default   { 'Red' }
 }
-
-$color = if ($findings.Count -gt 0) { 'Yellow' } else { 'Green' }
 Write-Host "==========================================================" -ForegroundColor $color
-Write-Host " Patch status complete | Findings: $($findings.Count) | Report: $jsonFile" -ForegroundColor $color
+switch ($Result.Status) {
+    'Partial' {
+        Write-Host " PARTIAL: $($checksNotRun.Count) check(s) could not run. Report: $jsonFile" -ForegroundColor $color
+        foreach ($c in $checksNotRun) { Write-Host "   - $($c.Check): $($c.Reason)" -ForegroundColor $color }
+    }
+    'Failed' {
+        Write-Host " FAILED: the checks ran but the report could not be written." -ForegroundColor $color
+    }
+    default {
+        Write-Host " Patch status $($Result.Status) | Findings: $($findings.Count) | Report: $jsonFile" -ForegroundColor $color
+    }
+}
 foreach ($f in $findings) { Write-Host "   - $f" -ForegroundColor $color }
 Write-Host "==========================================================" -ForegroundColor $color
-[PSCustomObject]$Report
-exit 0
+
+$Result
+exit $Result.ExitCode
